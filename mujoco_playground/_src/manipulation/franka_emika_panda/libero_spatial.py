@@ -252,9 +252,10 @@ def default_config() -> config_dict.ConfigDict:
           ),
           no_soln_reward=-0.01,
       ),
+      success_threshold=0.05,
       impl='warp',
-      naconmax=24 * 2048,
-      naccdmax=24 * 2048,
+      naconmax=48 * 2048,
+      naccdmax=48 * 2048,
       njmax=2048,
   )
   return config
@@ -279,15 +280,7 @@ class PandaLiberoSpatial(mjx_env.MjxEnv):
           f"task_id must be 0-8, got {task_id}. "
           f"Available: {list(_SPATIAL_TASKS.keys())}"
       )
-    self._task_id = task_id
-    self._task_description, bowl_region_name = _SPATIAL_TASKS[task_id]
-    z_offset = _BOWL_Z_OFFSETS[bowl_region_name]
-
-    # Compute bowl BDDL region bounds for sampling
-    region = _BDDL_REGIONS[bowl_region_name]
-    self._bowl_region_lo = jp.array([region[0], region[1]], dtype=jp.float32)
-    self._bowl_region_hi = jp.array([region[2], region[3]], dtype=jp.float32)
-    self._bowl_z = jp.float32(TABLE_SURFACE_Z + z_offset)
+    super().__init__(config, config_overrides)
 
     xml_path = (
         mjx_env.ROOT_PATH
@@ -296,63 +289,24 @@ class PandaLiberoSpatial(mjx_env.MjxEnv):
         / "xmls"
         / "mjx_libero_spatial.xml"
     )
-
-    super().__init__(config, config_overrides)
-
-    # Build combined assets: Panda menagerie + scene XMLs + LIBERO meshes
     self._xml_path = xml_path.as_posix()
-    xml = xml_path.read_text()
-
     self._model_assets = panda.get_assets()
     self._model_assets.update(_get_libero_assets())
 
-    mj_model = mujoco.MjModel.from_xml_string(xml, assets=self._model_assets)
+    mj_model = mujoco.MjModel.from_xml_string(xml_path.read_text(), assets=self._model_assets)
 
-    # Place the Panda robot base to match LIBERO: (-0.66, 0, 0.912)
+    # Place the Panda robot base to match LIBERO: (-0.6, 0, 0.912)
     mj_model.body('link0').pos[:] = [-0.6, 0.0, 0.912]
     mj_model.opt.timestep = self.sim_dt
 
     self._mj_model = mj_model
     self._mjx_model = mjx.put_model(mj_model, impl=self._config.impl)
-    self._action_scale = config.action_scale
 
+    self._task_id = task_id
     self._post_init(obj_name="akita_black_bowl_1", keyframe="home")
-
-    # Use FK to initialise Cartesian control
-    self._start_tip_transform = panda_kinematics.compute_franka_fk(
-        self._init_ctrl[:7]
-    )
 
     # Plate body (target location)
     self._plate_body = self._mj_model.body("plate_1").id
-
-    # Track qposadr and region bounds for distractor objects.
-    # Add bowl_2 with task-specific region
-    self._rand_obj_qposadr = []
-    self._rand_obj_region_lo = []
-    self._rand_obj_region_hi = []
-    self._rand_obj_z = []
-
-    # Add bowl_2 with task-specific region
-    bowl2_region = _BOWL2_REGION_BY_TASK[self._task_id]
-    bowl2_z = _BOWL_Z_OFFSETS[bowl2_region]
-    body = self._mj_model.body("akita_black_bowl_2")
-    qposadr = self._mj_model.jnt_qposadr[body.jntadr[0]]
-    region = _BDDL_REGIONS[bowl2_region]
-    self._rand_obj_qposadr.append(qposadr)
-    self._rand_obj_region_lo.append(jp.array([region[0], region[1]], dtype=jp.float32))
-    self._rand_obj_region_hi.append(jp.array([region[2], region[3]], dtype=jp.float32))
-    self._rand_obj_z.append(jp.float32(TABLE_SURFACE_Z + bowl2_z))
-
-    # Add other distractors
-    for name, dist_region_name, obj_z_offset in _RANDOM_OBJECTS_BASE:
-        body = self._mj_model.body(name)
-        qposadr = self._mj_model.jnt_qposadr[body.jntadr[0]]
-        region = _BDDL_REGIONS[dist_region_name]
-        self._rand_obj_qposadr.append(qposadr)
-        self._rand_obj_region_lo.append(jp.array([region[0], region[1]], dtype=jp.float32))
-        self._rand_obj_region_hi.append(jp.array([region[2], region[3]], dtype=jp.float32))
-        self._rand_obj_z.append(jp.float32(TABLE_SURFACE_Z + obj_z_offset))
 
     # Contact sensor IDs (table collision)
     self._table_hand_found_sensor = [
@@ -361,7 +315,7 @@ class PandaLiberoSpatial(mjx_env.MjxEnv):
     ]
 
   def _post_init(self, obj_name: str, keyframe: str):
-    """Initialise robot joint indices, sensors, and keyframe data."""
+    # Use FK to initialise Cartesian control
     arm_joints = [
         "joint1", "joint2", "joint3", "joint4",
         "joint5", "joint6", "joint7",
@@ -384,6 +338,45 @@ class PandaLiberoSpatial(mjx_env.MjxEnv):
     self._init_q = self._mj_model.keyframe(keyframe).qpos
     self._init_ctrl = self._mj_model.keyframe(keyframe).ctrl
     self._lowers, self._uppers = self._mj_model.actuator_ctrlrange.T
+
+    self._start_tip_transform = panda_kinematics.compute_franka_fk(
+        self._init_ctrl[:7]
+    )
+    
+    self._task_description, bowl_region_name = _SPATIAL_TASKS[self._task_id]
+    # Compute bowl BDDL region bounds for sampling
+    region = _BDDL_REGIONS[bowl_region_name]
+    self._bowl_region_lo = jp.array([region[0], region[1]], dtype=jp.float32)
+    self._bowl_region_hi = jp.array([region[2], region[3]], dtype=jp.float32)
+    self._bowl_z = jp.float32(TABLE_SURFACE_Z + _BOWL_Z_OFFSETS[bowl_region_name])
+
+    # Track qposadr and region bounds for distractor objects.
+    # Add bowl_2 with task-specific region
+    self._rand_obj_qposadr = []
+    self._rand_obj_region_lo = []
+    self._rand_obj_region_hi = []
+    self._rand_obj_z = []
+
+    # Add bowl_2 with task-specific region
+    bowl2_region = _BOWL2_REGION_BY_TASK[self._task_id]
+    body = self._mj_model.body("akita_black_bowl_2")
+    qposadr = self._mj_model.jnt_qposadr[body.jntadr[0]]
+    region = _BDDL_REGIONS[bowl2_region]
+    self._rand_obj_qposadr.append(qposadr)
+    self._rand_obj_region_lo.append(jp.array([region[0], region[1]], dtype=jp.float32))
+    self._rand_obj_region_hi.append(jp.array([region[2], region[3]], dtype=jp.float32))
+    self._rand_obj_z.append(jp.float32(TABLE_SURFACE_Z + _BOWL_Z_OFFSETS[bowl2_region]))
+
+    # Add other distractors
+    for name, dist_region_name, obj_z_offset in _RANDOM_OBJECTS_BASE:
+        body = self._mj_model.body(name)
+        qposadr = self._mj_model.jnt_qposadr[body.jntadr[0]]
+        region = _BDDL_REGIONS[dist_region_name]
+        self._rand_obj_qposadr.append(qposadr)
+        self._rand_obj_region_lo.append(jp.array([region[0], region[1]], dtype=jp.float32))
+        self._rand_obj_region_hi.append(jp.array([region[2], region[3]], dtype=jp.float32))
+        self._rand_obj_z.append(jp.float32(TABLE_SURFACE_Z + obj_z_offset))
+
 
   @property
   def task_id(self) -> int:
@@ -444,7 +437,11 @@ class PandaLiberoSpatial(mjx_env.MjxEnv):
 
     metrics = {
         "out_of_bounds": jp.array(0.0, dtype=float),
-        **{k: 0.0 for k in self._config.reward_config.scales.keys()},
+        **{
+            f'reward/{k}': 0.0 
+            for k in self._config.reward_config.scales.keys()
+        },
+        'reward/success': jp.array(0.0),
     }
     info = {
         "rng": rng,
@@ -487,15 +484,16 @@ class PandaLiberoSpatial(mjx_env.MjxEnv):
     }
     reward = jp.clip(sum(rewards.values()), -1e4, 1e4)
     reward += no_soln * self._config.reward_config.no_soln_reward
+    success = self._get_success(data, state.info)
 
     bowl_pos = data.xpos[self._obj_body]
     out_of_bounds = jp.any(jp.abs(bowl_pos[:2]) > 1.5)
     out_of_bounds |= bowl_pos[2] < 0.7
     done = out_of_bounds | jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any()
 
-    state.metrics.update(
-        **raw_rewards, out_of_bounds=out_of_bounds.astype(float)
-    )
+    state.metrics.update(out_of_bounds=out_of_bounds.astype(float))
+    state.metrics.update({f'reward/{k}': v for k, v in raw_rewards.items()})
+    state.metrics.update({'reward/success': success.astype(float)})
 
     state.info['_steps'] += self._config.action_repeat
     state.info['_steps'] = jp.where(
@@ -507,6 +505,11 @@ class PandaLiberoSpatial(mjx_env.MjxEnv):
     obs = self._get_obs(data, state.info)
     obs = jp.concat([obs, no_soln.reshape(1), action], axis=0)
     return State(data, obs, reward, done.astype(float), state.metrics, state.info)
+
+  def _get_success(self, data: mjx.Data, info: dict[str, Any]) -> jax.Array:
+    box_pos = data.xpos[self._obj_body]
+    plate_pos = data.xpos[self._plate_body]
+    return jp.linalg.norm(plate_pos - box_pos) < self._config.success_threshold
 
   def _get_reward(self, data: mjx.Data, info: Dict[str, Any]) -> Dict[str, Any]:
     bowl_pos = data.xpos[self._obj_body]
@@ -570,12 +573,18 @@ class PandaLiberoSpatial(mjx_env.MjxEnv):
     """
     # Position update
     scaled_pos = action[:3] * self._config.action_scale
-    new_tip_pos = current_tip_pos + scaled_pos
+    new_tip_pos = current_tip_pos.at[:3].add(scaled_pos)
 
     # Clip to workspace bounds (robot base frame)
-    new_tip_pos = new_tip_pos.at[0].set(jp.clip(new_tip_pos[0], 0.2, 1.0))
-    new_tip_pos = new_tip_pos.at[1].set(jp.clip(new_tip_pos[1], -0.5, 0.5))
-    new_tip_pos = new_tip_pos.at[2].set(jp.clip(new_tip_pos[2], -0.15, 0.5))
+    # new_tip_pos = new_tip_pos.at[0].set(jp.clip(new_tip_pos[0], 0.2, 1.0))
+    # new_tip_pos = new_tip_pos.at[1].set(jp.clip(new_tip_pos[1], -0.5, 0.5))
+    # new_tip_pos = new_tip_pos.at[2].set(jp.clip(new_tip_pos[2], -0.15, 0.5))
+
+    new_ctrl = current_ctrl
+
+    new_tip_pos = new_tip_pos.at[0].set(jp.clip(new_tip_pos[0], 0.25, 0.77))
+    new_tip_pos = new_tip_pos.at[1].set(jp.clip(new_tip_pos[1], -0.32, 0.32))
+    new_tip_pos = new_tip_pos.at[2].set(jp.clip(new_tip_pos[2], 0.02, 0.5))
 
     # Orientation update
     scaled_rot = action[3:6] * self._config.action_scale
@@ -597,7 +606,7 @@ class PandaLiberoSpatial(mjx_env.MjxEnv):
     new_tip_pos = jp.where(no_soln, current_tip_pos, new_tip_pos)
     new_tip_rot = jp.where(no_soln, current_tip_rot, new_tip_rot)
 
-    new_ctrl = current_ctrl.at[:7].set(out_jp)
+    new_ctrl = new_ctrl.at[:7].set(out_jp)
     # Continuous gripper: action[6] in [-1, 1] maps proportionally to delta
     claw_delta = action[6] * 0.02
     new_ctrl = new_ctrl.at[7].set(new_ctrl[7] + claw_delta)
@@ -635,5 +644,5 @@ class PandaLiberoSpatial(mjx_env.MjxEnv):
         bowl_mat[3:],     # partial rotation matrix (6 values)
         bowl_pos - gripper_pos,    # relative: gripper → bowl
         plate_pos - bowl_pos,      # relative: bowl → plate
-        data.ctrl - data.qpos[self._robot_qposadr[:-1]],
+        data.ctrl - data.qpos[self._robot_qposadr[:-1]], ## what does this equation do? 
     ])
