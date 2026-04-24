@@ -26,12 +26,13 @@ from mujoco import mjx
 from mujoco_playground._src import mjx_env
 from mujoco_playground._src.manipulation.franka_emika_panda import panda
 from mujoco_playground._src.manipulation.franka_emika_panda import panda_kinematics
+
 from mujoco_playground._src.mjx_env import State
 
 
 # Path to LIBERO assets relative to the workspace root.
 _LIBERO_ASSETS_ROOT = (
-    epath.Path(__file__).parent.parent.parent.parent.parent
+    epath.Path(__file__).parent.parent.parent.parent.parent.parent
     / "LIBERO"
     / "libero"
     / "libero"
@@ -93,6 +94,7 @@ _BOWL2_REGION_BY_TASK = {
 # Each task specifies: (description, bddl_region_name, z_offset)
 # For "on_X" tasks the z_offset places the bowl on top of the other object.
 
+BOWL_HALF_DIAMETER = 0.034 
 _BOWL_Z_OFFSETS = {
     "table_center": 0.02,
     "between_plate_ramekin_region": 0.02,
@@ -102,7 +104,9 @@ _BOWL_Z_OFFSETS = {
     "next_to_ramekin_region": 0.00,
     "cabinet_region": 0.22, 
     "stove_region": 0.03,
-    "box_region": 0.04}
+    "box_region": 0.04
+}
+
 _SPATIAL_TASKS = {
     0: (
         "pick_up_the_black_bowl_from_table_center_and_place_it_on_the_plate",
@@ -238,6 +242,7 @@ def _get_libero_assets() -> Dict[str, bytes]:
 
 def default_config() -> config_dict.ConfigDict:
   config = config_dict.create(
+      task_id=0,
       ctrl_dt=0.05,
       sim_dt=0.005,
       episode_length=500,
@@ -245,40 +250,44 @@ def default_config() -> config_dict.ConfigDict:
       action_scale=0.005,
       reward_config=config_dict.create(
           scales=config_dict.create(
-              gripper_bowl=4.0,
-              bowl_plate=8.0,
+              gripper_bowl=2.0,
+              grasp=2.0,
+              transport=8.0,
+              place=2.0,
               no_table_collision=0.25,
-              robot_target_qpos=0.3,
           ),
+          action_rate=-0.0005,
           no_soln_reward=-0.01,
       ),
       success_threshold=0.05,
       impl='warp',
-      naconmax=48 * 2048,
-      naccdmax=48 * 2048,
+      naconmax=2 * 48 * 2048,
+      naccdmax=2 * 48 * 2048,
       njmax=2048,
   )
   return config
 
 
+def safe_norm(x, axis=-1):
+    return jp.sqrt(jp.sum(jp.square(x), axis=axis) + 1e-8)
+
 class PandaLiberoSpatial(mjx_env.MjxEnv):
   """LIBERO Spatial: pick a black bowl from a spatial location, place on plate.
 
   The task_id (0-8) selects the bowl starting position from the 9 supported
-  LIBERO spatial task variants (all table-surface tasks; excludes the drawer
-  task).
+  LIBERO spatial task variants.  When task_id is None, a random task is
+  sampled every episode in reset().
   """
 
   def __init__(
       self,
       config: config_dict.ConfigDict = default_config(),
       config_overrides: Optional[Dict[str, Union[str, int, list[Any]]]] = None,
-      task_id: int = 0,
   ):
-    if task_id not in _SPATIAL_TASKS:
+    if config.task_id is not None and config.task_id not in _SPATIAL_TASKS:
       raise ValueError(
-          f"task_id must be 0-8, got {task_id}. "
-          f"Available: {list(_SPATIAL_TASKS.keys())}"
+          f"task_id must be 0-8 or None, got {config.task_id}. "
+          f"Available: {list(_SPATIAL_TASKS.keys())} or None for random."
       )
     super().__init__(config, config_overrides)
 
@@ -302,7 +311,6 @@ class PandaLiberoSpatial(mjx_env.MjxEnv):
     self._mj_model = mj_model
     self._mjx_model = mjx.put_model(mj_model, impl=self._config.impl)
 
-    self._task_id = task_id
     self._post_init(obj_name="akita_black_bowl_1", keyframe="home")
 
     # Plate body (target location)
@@ -342,32 +350,74 @@ class PandaLiberoSpatial(mjx_env.MjxEnv):
     self._start_tip_transform = panda_kinematics.compute_franka_fk(
         self._init_ctrl[:7]
     )
-    
-    self._task_description, bowl_region_name = _SPATIAL_TASKS[self._task_id]
-    # Compute bowl BDDL region bounds for sampling
-    region = _BDDL_REGIONS[bowl_region_name]
-    self._bowl_region_lo = jp.array([region[0], region[1]], dtype=jp.float32)
-    self._bowl_region_hi = jp.array([region[2], region[3]], dtype=jp.float32)
-    self._bowl_z = jp.float32(TABLE_SURFACE_Z + _BOWL_Z_OFFSETS[bowl_region_name])
 
-    # Track qposadr and region bounds for distractor objects.
-    # Add bowl_2 with task-specific region
+    self._random_task = self._config.task_id is None
+    num_tasks = len(_SPATIAL_TASKS)
+
+    if self._random_task:
+      # Pre-compute region arrays for ALL tasks so reset() can index
+      # dynamically with a sampled task_id.
+      bowl1_region_names = [_SPATIAL_TASKS[i][1] for i in range(num_tasks)]
+      self._all_bowl1_lo = jp.array(
+          [[_BDDL_REGIONS[r][0], _BDDL_REGIONS[r][1]] for r in bowl1_region_names],
+          dtype=jp.float32,
+      )  # (9, 2)
+      self._all_bowl1_hi = jp.array(
+          [[_BDDL_REGIONS[r][2], _BDDL_REGIONS[r][3]] for r in bowl1_region_names],
+          dtype=jp.float32,
+      )  # (9, 2)
+      self._all_bowl1_z = jp.array(
+          [TABLE_SURFACE_Z + _BOWL_Z_OFFSETS[r] for r in bowl1_region_names],
+          dtype=jp.float32,
+      )  # (9,)
+
+      # Bowl-2 (distractor) regions per task
+      bowl2_region_names = [_BOWL2_REGION_BY_TASK[i] for i in range(num_tasks)]
+      self._all_bowl2_lo = jp.array(
+          [[_BDDL_REGIONS[r][0], _BDDL_REGIONS[r][1]] for r in bowl2_region_names],
+          dtype=jp.float32,
+      )
+      self._all_bowl2_hi = jp.array(
+          [[_BDDL_REGIONS[r][2], _BDDL_REGIONS[r][3]] for r in bowl2_region_names],
+          dtype=jp.float32,
+      )
+      self._all_bowl2_z = jp.array(
+          [TABLE_SURFACE_Z + _BOWL_Z_OFFSETS[r] for r in bowl2_region_names],
+          dtype=jp.float32,
+      )
+
+      # Bowl-2 qposadr
+      bowl2_body = self._mj_model.body("akita_black_bowl_2")
+      self._bowl2_qposadr = self._mj_model.jnt_qposadr[bowl2_body.jntadr[0]]
+
+      self._num_tasks = num_tasks
+
+    else:
+      # Fixed task: original single-task behaviour
+      self._task_description, bowl_region_name = _SPATIAL_TASKS[self._config.task_id]
+      region = _BDDL_REGIONS[bowl_region_name]
+      self._bowl_region_lo = jp.array([region[0], region[1]], dtype=jp.float32)
+      self._bowl_region_hi = jp.array([region[2], region[3]], dtype=jp.float32)
+      self._bowl_z = jp.float32(TABLE_SURFACE_Z + _BOWL_Z_OFFSETS[bowl_region_name])
+
+    # Distractor objects (fixed regions, shared by both modes)
     self._rand_obj_qposadr = []
     self._rand_obj_region_lo = []
     self._rand_obj_region_hi = []
     self._rand_obj_z = []
 
-    # Add bowl_2 with task-specific region
-    bowl2_region = _BOWL2_REGION_BY_TASK[self._task_id]
-    body = self._mj_model.body("akita_black_bowl_2")
-    qposadr = self._mj_model.jnt_qposadr[body.jntadr[0]]
-    region = _BDDL_REGIONS[bowl2_region]
-    self._rand_obj_qposadr.append(qposadr)
-    self._rand_obj_region_lo.append(jp.array([region[0], region[1]], dtype=jp.float32))
-    self._rand_obj_region_hi.append(jp.array([region[2], region[3]], dtype=jp.float32))
-    self._rand_obj_z.append(jp.float32(TABLE_SURFACE_Z + _BOWL_Z_OFFSETS[bowl2_region]))
+    if not self._random_task:
+      # Bowl-2 with task-specific region (fixed task only)
+      bowl2_region = _BOWL2_REGION_BY_TASK[self._config.task_id]
+      body = self._mj_model.body("akita_black_bowl_2")
+      qposadr = self._mj_model.jnt_qposadr[body.jntadr[0]]
+      region = _BDDL_REGIONS[bowl2_region]
+      self._rand_obj_qposadr.append(qposadr)
+      self._rand_obj_region_lo.append(jp.array([region[0], region[1]], dtype=jp.float32))
+      self._rand_obj_region_hi.append(jp.array([region[2], region[3]], dtype=jp.float32))
+      self._rand_obj_z.append(jp.float32(TABLE_SURFACE_Z + _BOWL_Z_OFFSETS[bowl2_region]))
 
-    # Add other distractors
+    # Other distractors (cookies, ramekin, plate) — always the same regions
     for name, dist_region_name, obj_z_offset in _RANDOM_OBJECTS_BASE:
         body = self._mj_model.body(name)
         qposadr = self._mj_model.jnt_qposadr[body.jntadr[0]]
@@ -380,33 +430,57 @@ class PandaLiberoSpatial(mjx_env.MjxEnv):
 
   @property
   def task_id(self) -> int:
-    return self._task_id
+    return self._config.task_id if self._config.task_id is not None else self._current_task_id
 
   @property
   def task_description(self) -> str:
-    return self._task_description
+    return self._task_description if self._config.task_id is not None else self._current_task_description
 
   def reset(self, rng: jax.Array) -> State:
     rng, rng_bowl = jax.random.split(rng)
 
-    # Bowl position: sample uniformly within BDDL region
-    bowl_xy = self._bowl_region_lo + jax.random.uniform(rng_bowl, (2,)) * (
-        self._bowl_region_hi - self._bowl_region_lo
-    )
-    bowl_pos = jp.array([bowl_xy[0], bowl_xy[1], self._bowl_z])
+    init_q = jp.array(self._init_q)
 
-    # Set initial qpos with bowl at the computed position
-    init_q = (
-        jp.array(self._init_q)
-        .at[self._obj_qposadr : self._obj_qposadr + 3]
-        .set(bowl_pos)
-    )
+    if self._random_task:
+      # ── Random-task mode: sample task_id, index into pre-computed arrays ──
+      rng, rng_task = jax.random.split(rng)
+      task_id = jax.random.randint(rng_task, (), minval=0, maxval=self._num_tasks)
 
-    # Random yaw for bowl (quat stored at qposadr+3)
-    rng, rng_yaw = jax.random.split(rng)
-    yaw = jax.random.uniform(rng_yaw, (), minval=-jp.pi, maxval=jp.pi)
-    quat = jp.array([jp.cos(yaw / 2), 0.0, 0.0, jp.sin(yaw / 2)])
-    init_q = init_q.at[self._obj_qposadr + 3 : self._obj_qposadr + 7].set(quat)
+      # Bowl-1 (target)
+      lo = self._all_bowl1_lo[task_id]
+      hi = self._all_bowl1_hi[task_id]
+      bowl_xy = lo + jax.random.uniform(rng_bowl, (2,)) * (hi - lo)
+      bowl_pos = jp.array([bowl_xy[0], bowl_xy[1], self._all_bowl1_z[task_id]])
+      init_q = init_q.at[self._obj_qposadr : self._obj_qposadr + 3].set(bowl_pos)
+
+      rng, rng_yaw = jax.random.split(rng)
+      yaw = jax.random.uniform(rng_yaw, (), minval=-jp.pi, maxval=jp.pi)
+      quat = jp.array([jp.cos(yaw / 2), 0.0, 0.0, jp.sin(yaw / 2)])
+      init_q = init_q.at[self._obj_qposadr + 3 : self._obj_qposadr + 7].set(quat)
+
+      # Bowl-2 (distractor, task-dependent region)
+      rng, rng_b2, rng_yaw = jax.random.split(rng, 3)
+      lo2 = self._all_bowl2_lo[task_id]
+      hi2 = self._all_bowl2_hi[task_id]
+      b2_xy = lo2 + jax.random.uniform(rng_b2, (2,)) * (hi2 - lo2)
+      b2_pos = jp.array([b2_xy[0], b2_xy[1], self._all_bowl2_z[task_id]])
+      init_q = init_q.at[self._bowl2_qposadr : self._bowl2_qposadr + 3].set(b2_pos)
+      yaw = jax.random.uniform(rng_yaw, (), minval=-jp.pi, maxval=jp.pi)
+      quat = jp.array([jp.cos(yaw / 2), 0.0, 0.0, jp.sin(yaw / 2)])
+      init_q = init_q.at[self._bowl2_qposadr + 3 : self._bowl2_qposadr + 7].set(quat)
+
+    else:
+      # ── Fixed-task mode: original single-region behaviour ──
+      bowl_xy = self._bowl_region_lo + jax.random.uniform(rng_bowl, (2,)) * (
+          self._bowl_region_hi - self._bowl_region_lo
+      )
+      bowl_pos = jp.array([bowl_xy[0], bowl_xy[1], self._bowl_z])
+      init_q = init_q.at[self._obj_qposadr : self._obj_qposadr + 3].set(bowl_pos)
+
+      rng, rng_yaw = jax.random.split(rng)
+      yaw = jax.random.uniform(rng_yaw, (), minval=-jp.pi, maxval=jp.pi)
+      quat = jp.array([jp.cos(yaw / 2), 0.0, 0.0, jp.sin(yaw / 2)])
+      init_q = init_q.at[self._obj_qposadr + 3 : self._obj_qposadr + 7].set(quat)
 
     # Randomize distractor object positions and yaw rotations
     for qposadr, lo, hi, z in zip(
@@ -419,7 +493,6 @@ class PandaLiberoSpatial(mjx_env.MjxEnv):
       obj_xy = lo + jax.random.uniform(rng_obj, (2,)) * (hi - lo)
       obj_pos = jp.array([obj_xy[0], obj_xy[1], z])
       init_q = init_q.at[qposadr : qposadr + 3].set(obj_pos)
-      # Random yaw rotation
       yaw = jax.random.uniform(rng_yaw, (), minval=-jp.pi, maxval=jp.pi)
       quat = jp.array([jp.cos(yaw / 2), 0.0, 0.0, jp.sin(yaw / 2)])
       init_q = init_q.at[qposadr + 3 : qposadr + 7].set(quat)
@@ -446,22 +519,49 @@ class PandaLiberoSpatial(mjx_env.MjxEnv):
     info = {
         "rng": rng,
         "reached_bowl": jp.array(0.0, dtype=float),
+        "grasped_bowl": jp.array(0.0, dtype=float),
+        "placed_bowl": jp.array(0.0, dtype=float),
+        'prev_reward': jp.array(0.0, dtype=float),
         "current_pos": self._start_tip_transform[:3, 3],
         "current_rot": self._start_tip_transform[:3, :3],
+        "joint_velocity": data.qvel[self._robot_qposadr][:-1],
+        "joint_position": data.qpos[self._robot_qposadr][:-1],
+        # "ctrl": self._init_ctrl,
+        'newly_reset': jp.array(False, dtype=bool),
+        "prev_action": jp.zeros(self.action_size, dtype=float),
         "_steps": jp.array(0, dtype=int),
     }
+    reward, done = jp.zeros(2)
+
     obs = self._get_obs(data, info)
     obs = jp.concat([obs, jp.zeros(1), jp.zeros(self.action_size)], axis=0)
-    reward, done = jp.zeros(2)
+
     return State(data, obs, reward, done, metrics, info)
 
   def step(self, state: State, action: jax.Array) -> State:
-    newly_reset = state.info['_steps'] == 0
+    state.info['newly_reset'] = state.info['_steps'] == 0
+
+    newly_reset = state.info['newly_reset']
+    state.info['prev_reward'] = jp.where(
+        newly_reset, 0.0, state.info['prev_reward']
+    )
     state.info['current_pos'] = jp.where(
         newly_reset, self._start_tip_transform[:3, 3], state.info['current_pos']
     )
     state.info['current_rot'] = jp.where(
         newly_reset, self._start_tip_transform[:3, :3], state.info['current_rot']
+    )
+    state.info['reached_bowl'] = jp.where(
+        newly_reset, 0.0, state.info['reached_bowl']
+    )
+    state.info['grasped_bowl'] = jp.where(
+        newly_reset, 0.0, state.info['grasped_bowl']
+    )
+    state.info['placed_bowl'] = jp.where(
+        newly_reset, 0.0, state.info['placed_bowl']
+    )
+    state.info['prev_action'] = jp.where(
+        newly_reset, 0.0, state.info['prev_action']
     )
 
     # Cartesian IK control: action = [dx, dy, dz, droll, dpitch, dyaw, gripper]
@@ -472,29 +572,54 @@ class PandaLiberoSpatial(mjx_env.MjxEnv):
         action,
     )
     ctrl = jp.clip(ctrl, self._lowers, self._uppers)
-    state.info['current_pos'] = new_tip_pos
-    state.info['current_rot'] = new_tip_rot
+    state.info.update({'current_pos': new_tip_pos})
+    state.info.update({'current_rot': new_tip_rot})
+    # state.info.update({'ctrl': ctrl})
 
     data = mjx_env.step(self._mjx_model, state.data, ctrl, self.n_substeps)
+
+    state.info.update({
+        "joint_velocity": data.qvel[self._robot_qposadr][:-1],
+        "joint_position": data.qpos[self._robot_qposadr][:-1],
+    })
 
     raw_rewards = self._get_reward(data, state.info)
     rewards = {
         k: v * self._config.reward_config.scales[k]
         for k, v in raw_rewards.items()
     }
-    reward = jp.clip(sum(rewards.values()), -1e4, 1e4)
-    reward += no_soln * self._config.reward_config.no_soln_reward
-    success = self._get_success(data, state.info)
+    total_reward = jp.clip(sum(rewards.values()), -1e4, 1e4)
 
+    da = safe_norm(action[:3] - state.info['prev_action'][:3])
+    state.info['prev_action'] = action
+    total_reward += self._config.reward_config.action_rate * da
+    total_reward += no_soln * self._config.reward_config.no_soln_reward
+
+    # Reward progress
+    reward = jp.maximum(
+        total_reward - state.info['prev_reward'], jp.zeros_like(total_reward)
+    )
+    state.info['prev_reward'] = total_reward
+    reward = jp.where(newly_reset, 0.0, reward)  # Prevent first-step artifact
+
+
+    success = self._get_success(data, state.info)
     bowl_pos = data.xpos[self._obj_body]
     out_of_bounds = jp.any(jp.abs(bowl_pos[:2]) > 1.5)
     out_of_bounds |= bowl_pos[2] < 0.7
-    done = out_of_bounds | jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any()
 
     state.metrics.update(out_of_bounds=out_of_bounds.astype(float))
     state.metrics.update({f'reward/{k}': v for k, v in raw_rewards.items()})
     state.metrics.update({'reward/success': success.astype(float)})
 
+    done = (
+        out_of_bounds
+        | jp.isnan(data.qpos).any()
+        | jp.isnan(data.qvel).any()
+        | success
+    ) 
+
+    # Ensure exact sync between newly_reset and the autoresetwrapper.
     state.info['_steps'] += self._config.action_repeat
     state.info['_steps'] = jp.where(
         done | (state.info['_steps'] >= self._config.episode_length),
@@ -509,34 +634,45 @@ class PandaLiberoSpatial(mjx_env.MjxEnv):
   def _get_success(self, data: mjx.Data, info: dict[str, Any]) -> jax.Array:
     box_pos = data.xpos[self._obj_body]
     plate_pos = data.xpos[self._plate_body]
-    return jp.linalg.norm(plate_pos - box_pos) < self._config.success_threshold
+    return safe_norm(plate_pos - box_pos) < self._config.success_threshold
 
   def _get_reward(self, data: mjx.Data, info: Dict[str, Any]) -> Dict[str, Any]:
+    phys_nan = jp.isnan(data.qpos).any()
+    jax.debug.callback(lambda x: print("!!! PHYSICS EXPLODED !!!") if x else None, phys_nan)
+
     bowl_pos = data.xpos[self._obj_body]
     plate_pos = data.xpos[self._plate_body]
     gripper_pos = data.site_xpos[self._gripper_site]
+    table_surface_z = 0.9  # TABLE_SURFACE_Z
 
-    # Gripper → bowl distance reward
-    gripper_bowl_dist = jp.linalg.norm(bowl_pos - gripper_pos)
-    gripper_bowl = 1 - jp.tanh(5 * gripper_bowl_dist)
-
-    # Bowl → plate distance reward (activated once the gripper has reached the bowl)
-    bowl_plate_dist = jp.linalg.norm(plate_pos - bowl_pos)
-    bowl_plate = 1 - jp.tanh(5 * bowl_plate_dist)
+    # ── Phase 1: Reach — gripper approaches bowl ──
+    gripper_bowl_dist = safe_norm(bowl_pos - gripper_pos)
+    gripper_bowl_reward = 1 - jp.tanh(5 * gripper_bowl_dist)
 
     # Track whether gripper has reached the bowl
-    info["reached_bowl"] = 1.0 * jp.maximum(
+    info["reached_bowl"] = jp.maximum(
         info["reached_bowl"],
-        (gripper_bowl_dist < 0.012),
+        (gripper_bowl_dist < 0.012).astype(float),
     )
 
-    # Regularize arm toward home configuration
-    robot_target_qpos = 1 - jp.tanh(
-        jp.linalg.norm(
-            data.qpos[self._robot_arm_qposadr]
-            - self._init_q[self._robot_arm_qposadr]
-        )
-    )
+    # ── Phase 2: Grasp — bowl lifted off table ──
+    gripper_bowl_xy_distance = safe_norm(gripper_pos[:2] - bowl_pos[:2])
+    bowl_near_gripper = (jp.abs(gripper_bowl_xy_distance - BOWL_HALF_DIAMETER) < 0.01).astype(float)
+    bowl_lifted = (bowl_pos[2] > table_surface_z + 0.05).astype(float)
+    grasp_reward = bowl_lifted * bowl_near_gripper
+    info["grasped_bowl"] = grasp_reward
+
+    # ── Phase 3: Transport — minimize bowl-plate distance (only after grasp) ──
+    bowl_plate_xy_dist = safe_norm(plate_pos[:2] - bowl_pos[:2])
+    bowl_plate = 1 - jp.tanh(5 * bowl_plate_xy_dist)
+    transport_reward = bowl_plate * info["grasped_bowl"]
+
+    # ── Phase 4: Place — bowl on plate and settled ──
+    bowl_on_plate = (bowl_plate_xy_dist < 0.05).astype(float)
+    bowl_height_ok = (bowl_pos[2] < table_surface_z + 0.06).astype(float)
+    place_reward = bowl_on_plate * bowl_height_ok * info["grasped_bowl"]
+
+    info["placed_bowl"] = jp.maximum(info["placed_bowl"], place_reward)
 
     # Table collision penalty
     hand_table_collision = [
@@ -547,10 +683,11 @@ class PandaLiberoSpatial(mjx_env.MjxEnv):
     no_table_collision = (1 - table_collision).astype(float)
 
     return {
-        "gripper_bowl": gripper_bowl,
-        "bowl_plate": bowl_plate * info["reached_bowl"],
+        "gripper_bowl": gripper_bowl_reward,
+        "grasp": grasp_reward,
+        "transport": transport_reward,
+        "place": place_reward,
         "no_table_collision": no_table_collision,
-        "robot_target_qpos": robot_target_qpos,
     }
 
   def _move_tip(
@@ -567,6 +704,7 @@ class PandaLiberoSpatial(mjx_env.MjxEnv):
       current_tip_rot: (3,3) current EE rotation matrix.
       current_ctrl:    (8,) current joint ctrl.
       action:          (7,) [dx, dy, dz, droll, dpitch, dyaw, gripper].
+      actual_qpos_arm: (7,) actual simulated joint positions.
 
     Returns:
       (new_ctrl, new_tip_pos, new_tip_rot, no_soln)
@@ -582,9 +720,9 @@ class PandaLiberoSpatial(mjx_env.MjxEnv):
 
     new_ctrl = current_ctrl
 
-    new_tip_pos = new_tip_pos.at[0].set(jp.clip(new_tip_pos[0], 0.25, 0.77))
-    new_tip_pos = new_tip_pos.at[1].set(jp.clip(new_tip_pos[1], -0.32, 0.32))
-    new_tip_pos = new_tip_pos.at[2].set(jp.clip(new_tip_pos[2], 0.02, 0.5))
+    new_tip_pos = new_tip_pos.at[0].set(jp.clip(new_tip_pos[0], -1.0, 1.0))
+    new_tip_pos = new_tip_pos.at[1].set(jp.clip(new_tip_pos[1], -0.5, 0.5))
+    new_tip_pos = new_tip_pos.at[2].set(jp.clip(new_tip_pos[2], -0.5, 0.5))
 
     # Orientation update
     scaled_rot = action[3:6] * self._config.action_scale
@@ -596,7 +734,6 @@ class PandaLiberoSpatial(mjx_env.MjxEnv):
     new_tip_mat = new_tip_mat.at[:3, :3].set(new_tip_rot)
     new_tip_mat = new_tip_mat.at[:3, 3].set(new_tip_pos)
 
-    current_ctrl = jp.asarray(current_ctrl) ## check this later
     out_jp = panda_kinematics.compute_franka_ik(
         new_tip_mat, current_ctrl[6], current_ctrl[:7]
     )

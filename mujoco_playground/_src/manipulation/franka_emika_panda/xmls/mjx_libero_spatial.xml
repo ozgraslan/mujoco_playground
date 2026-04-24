@@ -2,7 +2,7 @@
   <include file="mjx_panda.xml"/>
 
   <statistic center="0 0 0.4" extent="1"/>
-  <size njmax="100000" nconmax="512" nstack="1000000"/>
+  <!-- <size njmax="100000" nconmax="512" nstack="1000000"/> -->
 
   <option timestep="0.005" iterations="10" ls_iterations="16" integrator="implicitfast">
     <flag eulerdamp="disable"/>
@@ -338,19 +338,22 @@
     <camera name="agentview" pos="0.658613 0 1.61035" quat="0.638018 0.30485 0.30485 0.638018" mode="fixed"/>
     <!-- <camera name="frontview" pos="1 0 1.48" quat="0.560842 0.430646 0.430646 0.560842" mode="fixed"/>
     <camera name="birdview" pos="-0.2 0 3" quat="0.707107 0 0 0.707107" mode="fixed"/> -->
-    <camera name="sideview" pos="-0.0565177 1.27612 1.48796" quat="0.00990507 0.00687796 0.591223 0.806418" mode="fixed"/>
+    <!-- <camera name="shoulder_left" pos="-0.5 0.45 1.2" quat="0.48 0.18 -0.32 -0.79" fovy="75" mode="fixed"/>
+    <camera name="shoulder_right" pos="-0.5 -0.45 1.2" quat="0.79 0.32 -0.18 -0.48" fovy="75" mode="fixed"/> -->
+    <camera name="shoulder_right" pos="-0.5 -0.45 1.2" quat="0.78 0.45 -0.20 -0.45" fovy="75" mode="fixed"/>
+    <camera name="shoulder_left" pos="-0.5 0.45 1.2" quat="0.45 0.20 -0.45 -0.78" fovy="75" mode="fixed"/>
   </worldbody>
 
   <include file="libero_spatial_sensor.xml"/>
 
   <keyframe>
     <key name="home"
-      qpos="0.1 -0.161037389 0.0 -2.44459747 0.0 2.2267522 0.7853982 0.04 0.04
+      qpos="0.1 0.0 0.0 -2.0 0.0 2.0 0.78 0.04 0.04
             -0.075 0 0.92 1 0 0 0
             0.06 0.2 0.905 1 0 0 0
             -0.18 0.32 0.92 1 0 0 0
             0.07 0.03 0.91 1 0 0 0
             -0.2 0.2 0.91 1 0 0 0"
-      ctrl="0.1 -0.161037389 0.0 -2.44459747 0.0 2.2267522 0.7853982 0.04"/>
+      ctrl="0.1 0.0 0.0 -2.0 0.0 2.0 0.78 0.04"/>
   </keyframe>
 </mujoco>
